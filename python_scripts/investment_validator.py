@@ -1,7 +1,7 @@
 """
 투자실적 검증 자동화 프로그램 (신규 양식 대응)
 
-실제 투자이력과 전산(ERP) 상 등록된 투자이력을 비교하여
+실제 투자이력과 전산(MIS) 상 등록된 투자이력을 비교하여
 미등록 및 부서코드/계정코드 누락 사항을 검출합니다.
 
 신규 양식 구조:
@@ -37,7 +37,7 @@ except ImportError:
 class Config:
     """프로그램 설정 클래스"""
     base_dir: Path = Path(__file__).resolve().parents[1]
-    erp_dir: Path | None = None
+    MIS_dir: Path | None = None
     output_dir: Path | None = None
     
     # 헤더 탐지 설정
@@ -51,8 +51,8 @@ class Config:
     column_aliases: dict[str, list[str]] = None
     
     def __post_init__(self):
-        # 기본 ERP 디렉터리 자동 감지: 여러 후보 폴더명을 확인합니다.
-        if self.erp_dir is None:
+        # 기본 MIS 디렉터리 자동 감지: 여러 후보 폴더명을 확인합니다.
+        if self.MIS_dir is None:
             candidates = [
                 self.base_dir / "종합정보 투자실적",
                 self.base_dir / "투자리스트_종합정보시스템",
@@ -60,11 +60,11 @@ class Config:
             ]
             for c in candidates:
                 if c.exists() and c.is_dir():
-                    self.erp_dir = c
+                    self.MIS_dir = c
                     break
             else:
                 # 후보 미발견 시 기존 경로를 기본값으로 설정
-                self.erp_dir = self.base_dir / "종합정보 투자실적"
+                self.MIS_dir = self.base_dir / "종합정보 투자실적"
 
         if self.output_dir is None:
             self.output_dir = self.base_dir / "result"
@@ -74,7 +74,7 @@ class Config:
                 "공장": ["공장", "공장명", "사업장", "사업장명"],
                 "부서": ["부서", "부서명", "사용부서", "요청부서", "부서(팀)"],
                 "투자명": ["투자명", "건명", "품의명", "과제명", "내역"],
-                "투자코드": ["투자코드", "코드", "erp코드", "모코드", "자코드", "부서코드", "유형"],
+                "투자코드": ["투자코드", "코드", "MIS코드", "모코드", "자코드", "부서코드", "유형"],
                 "자본적": ["자본적", "자본", "capex", "품의금액자본적"],
                 "수익적": ["수익적", "수익", "opex", "품의금액수익적"],
             }
@@ -150,8 +150,8 @@ class DataNormalizer:
             ""
         )
         
-        # 3단계: 특수값 치환
-        normalized = normalized.replace({"전사공통": "본사"})
+        # 3단계: 특수값 치환 (본부공장은 본사와 동일 조직으로 취급)
+        normalized = normalized.replace({"전사공통": "본사", "본부공장": "본사", "본부": "본사"})
         
         # 4단계: '공장' 접미사 제거 후 재통일
         # 예: "남양주공장" → "남양주" → "남양주공장" (통일)
@@ -179,11 +179,11 @@ class DataNormalizer:
 
 
 # ============================================================================
-# ERP 파일 처리
+# MIS 파일 처리
 # ============================================================================
 
-class ERPFileHandler:
-    """ERP(종합정보시스템) 파일 처리"""
+class MISFileHandler:
+    """MIS(종합정보시스템) 파일 처리"""
     
     REQUIRED_COLUMNS = ["공장", "자코드", "계정코드"]
     
@@ -192,35 +192,35 @@ class ERPFileHandler:
         self.normalizer = normalizer
     
     def pick_latest_file(self) -> Path:
-        """최신 ERP 파일 선택 (~$ 임시파일 제외)"""
+        """최신 MIS 파일 선택 (~$ 임시파일 제외)"""
         files = sorted(
-            [p for p in self.config.erp_dir.glob("*.xlsx") if not p.name.startswith("~$")],
+            [p for p in self.config.MIS_dir.glob("*.xlsx") if not p.name.startswith("~$")],
             key=lambda p: p.stat().st_mtime,
             reverse=True
         )
         
         if not files:
             raise FileNotFoundError(
-                f"ERP 파일을 찾을 수 없습니다: {self.config.erp_dir}"
+                f"MIS 파일을 찾을 수 없습니다: {self.config.MIS_dir}"
             )
         
-        logger.info(f"ERP 파일 선택: {files[0].name}")
+        logger.info(f"MIS 파일 선택: {files[0].name}")
         return files[0]
     
     def load_file(self, file_path: Path) -> pd.DataFrame:
-        """ERP 파일 로드 및 전처리"""
-        logger.info(f"ERP 파일 로딩 중: {file_path}")
+        """MIS 파일 로드 및 전처리"""
+        logger.info(f"MIS 파일 로딩 중: {file_path}")
         
         try:
             df = pd.read_excel(file_path, dtype=str, engine="openpyxl")
         except Exception as e:
-            raise ValueError(f"ERP 파일 로딩 실패: {e}") from e
+            raise ValueError(f"MIS 파일 로딩 실패: {e}") from e
         
         # 필수 컬럼 검증
         missing_cols = set(self.REQUIRED_COLUMNS) - set(df.columns)
         if missing_cols:
             raise ValueError(
-                f"ERP 파일에 필수 컬럼이 없습니다: {missing_cols}\n"
+                f"MIS 파일에 필수 컬럼이 없습니다: {missing_cols}\n"
                 f"현재 컬럼: {list(df.columns)}"
             )
         
@@ -237,7 +237,7 @@ class ERPFileHandler:
         df = df[df["자코드"] != ""].copy()
         
         # 0~150번 코드의 기록용 등록(본사, 금액0) 필터링
-        # - ERP에는 "기록용"으로 본사에 금액 0원으로 등록된 행이 있을 수 있음
+        # - MIS에는 "기록용"으로 본사에 금액 0원으로 등록된 행이 있을 수 있음
         # - 실제 투자이력 기준으로는 미등록 처리되어야 하므로, 아래 조건을 만족하는 행만 제외
         #   (공장=본사) AND (자코드 번호 0~150) AND (승인/실적/계획 금액이 모두 0)
         #
@@ -285,7 +285,7 @@ class ERPFileHandler:
         
 
         # =========================================================
-        # ERP 입력오류 후보 검출(제외는 validate 단계에서 수행)
+        # MIS 입력오류 후보 검출(제외는 validate 단계에서 수행)
         # - "본사 단독 + 금액 입력" 형태의 코드 목록을 후보로 뽑아 attrs에 저장
         # =========================================================
         amt_cols = [c for c in ["품의승인금액", "완료보고실적"] if c in df.columns]
@@ -308,19 +308,19 @@ class ERPFileHandler:
             df.attrs["hq_amount_error_candidate_codes"] = cand_codes
             if cand_codes:
                 df.attrs["hq_amount_error_candidate_df"] = df[df["자코드"].isin(cand_codes)].copy()
-                logger.warning(f"ERP 입력오류 후보(본사 단독+금액입력) 코드 {len(cand_codes)}개 검출 (최종 제외여부는 실제 공장 기준으로 판단)")
+                logger.warning(f"MIS 입력오류 후보(본사 단독+금액입력) 코드 {len(cand_codes)}개 검출 (최종 제외여부는 실제 공장 기준으로 판단)")
             else:
                 df.attrs["hq_amount_error_candidate_df"] = pd.DataFrame(columns=df.columns)
         else:
             df.attrs["hq_amount_error_candidate_codes"] = []
             df.attrs["hq_amount_error_candidate_df"] = pd.DataFrame(columns=df.columns)
-        logger.info(f"ERP 데이터 로딩 완료: {len(df)}행")
+        logger.info(f"MIS 데이터 로딩 완료: {len(df)}행")
         return df
     
     def aggregate_by_key(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         자코드 + 공장 단위로 집계
-        
+
         0~150번 코드는 공장별로 별도 등록되므로 공장 구분 필요
         151번 이상 자코드는 전사 고유값이지만, 공장 정보도 함께 집계
         """
@@ -328,24 +328,36 @@ class ERPFileHandler:
         def get_code_number(code):
             match = re.search(r'(\d{3})$', code)
             return int(match.group(1)) if match else -1
-        
+
         df["코드번호"] = df["자코드"].apply(get_code_number)
-        
+
+        # 금액 컬럼 숫자화 (존재 시)
+        df_work = df.copy()
+        for src, dst in [("투자계획금액", "_투자계획금액"), ("품의승인금액", "_품의승인금액")]:
+            if src in df_work.columns:
+                df_work[dst] = self.normalizer.to_number_series(df_work[src])
+            else:
+                df_work[dst] = 0.0
+        df_work["_계정코드입력여부"] = df_work["계정코드"].ne("")
+
         # 0~150번 코드: 공장별로 집계 (공장 구분 필요)
         # 151번 이상: 전사 고유값이지만 공장 정보도 저장
         aggregated = (
-            df.assign(계정코드입력여부=df["계정코드"].ne(""))
+            df_work
             .groupby(["자코드", "공장"], dropna=False)
             .agg(
-                ERP행수=("자코드", "size"),
-                계정코드입력여부=("계정코드입력여부", "any"),
+                MIS행수=("자코드", "size"),
+                계정코드입력여부=("_계정코드입력여부", "any"),
+                계정코드값=("계정코드", lambda s: ",".join(sorted({str(x) for x in s if str(x).strip()}))),
+                투자계획금액=("_투자계획금액", "sum"),
+                품의승인금액=("_품의승인금액", "sum"),
                 코드번호=("코드번호", "first")
             )
             .reset_index()
         )
-        
+
         logger.info(
-            f"ERP 집계 완료: {len(aggregated)}개 (자코드+공장 조합), "
+            f"MIS 집계 완료: {len(aggregated)}개 (자코드+공장 조합), "
             f"고유 자코드: {df['자코드'].nunique()}개"
         )
         return aggregated
@@ -1036,24 +1048,10 @@ class ActualFileHandler:
         """
         result = df.copy()
         
-        # 합산 행 판별 함수
+        # 합산 행 판별: 부서(팀)가 '전공장' 또는 '전부서'인 행
         def is_summary_row(row) -> bool:
-            투자명 = str(row.get("투자명", "")).strip().lower()
-            공장 = str(row.get("공장", "")).strip()
             부서 = str(row.get("부서", "")).strip()
-
-            summary_keywords = ["소계", "합계", "총계", "전사", "계"]
-            if any(kw in 투자명 for kw in summary_keywords):
-                return True
-
-            code_raw = str(row.get("코드_원본(자코드)", "")).strip()
-            if (공장 in {"-", ""} and 부서 in {"-", ""}) and (code_raw in {"-", "", "nan"}):
-                return True
-
-            if (부서 in {"-", ""}) and (len(투자명) <= 4):
-                return True
-
-            return False
+            return 부서 in {"전공장", "전부서"}
         
         # 자코드는 이미 forward fill된 "자코드_산출" 사용
         result["자코드"] = result["자코드_산출"]
@@ -1109,7 +1107,7 @@ class InvestmentValidator:
     def __init__(self, config: Config):
         self.config = config
         self.normalizer = DataNormalizer(config)
-        self.erp_handler = ERPFileHandler(config, self.normalizer)
+        self.mis_handler = MISFileHandler(config, self.normalizer)
         self.actual_handler = ActualFileHandler(config, self.normalizer)
     
     def validate(
@@ -1123,9 +1121,9 @@ class InvestmentValidator:
         Returns:
             검증 결과 딕셔너리
         """
-        # ERP 데이터 로드
-        erp_path = self.erp_handler.pick_latest_file()
-        erp_df = self.erp_handler.load_file(erp_path)
+        # MIS 데이터 로드
+        mis_path = self.mis_handler.pick_latest_file()
+        mis_df = self.mis_handler.load_file(mis_path)
 
         # 실제 데이터 로드
         targets, actual_all = self.actual_handler.load_file(
@@ -1134,10 +1132,10 @@ class InvestmentValidator:
         )
 
         # =========================================================
-        # ERP 입력오류 최종 판정: "본사 단독 + 금액 입력" 후보 중
+        # MIS 입력오류 최종 판정: "본사 단독 + 금액 입력" 후보 중
         # 실제 투자이력(등록대상)에서 '생산 공장'으로 등장하는 코드만 오류로 확정
         # =========================================================
-        cand_codes = set(erp_df.attrs.get("hq_amount_error_candidate_codes", []))
+        cand_codes = set(mis_df.attrs.get("hq_amount_error_candidate_codes", []))
         final_bad_codes = set()
         if cand_codes:
             prod_mask = (
@@ -1150,18 +1148,18 @@ class InvestmentValidator:
             final_bad_codes = cand_codes & prod_codes
 
         if final_bad_codes:
-            before = len(erp_df)
-            erp_df = erp_df[~erp_df["자코드"].isin(final_bad_codes)].copy()
-            removed = before - len(erp_df)
-            logger.warning(f"ERP 입력오류 확정(본사 단독+금액입력): 코드 {len(final_bad_codes)}개, 행 {removed}건 제외 → 전산미등록으로 처리")
-            erp_df.attrs["hq_amount_error_df"] = erp_df.attrs.get("hq_amount_error_candidate_df", pd.DataFrame()).copy()
-            erp_df.attrs["hq_amount_error_codes"] = sorted(final_bad_codes)
+            before = len(mis_df)
+            mis_df = mis_df[~mis_df["자코드"].isin(final_bad_codes)].copy()
+            removed = before - len(mis_df)
+            logger.warning(f"MIS 입력오류 확정(본사 단독+금액입력): 코드 {len(final_bad_codes)}개, 행 {removed}건 제외 → 전산미등록으로 처리")
+            mis_df.attrs["hq_amount_error_df"] = mis_df.attrs.get("hq_amount_error_candidate_df", pd.DataFrame()).copy()
+            mis_df.attrs["hq_amount_error_codes"] = sorted(final_bad_codes)
         else:
-            erp_df.attrs["hq_amount_error_df"] = pd.DataFrame(columns=erp_df.columns)
-            erp_df.attrs["hq_amount_error_codes"] = []
+            mis_df.attrs["hq_amount_error_df"] = pd.DataFrame(columns=mis_df.columns)
+            mis_df.attrs["hq_amount_error_codes"] = []
 
-        # 집계는 최종 ERP(필터 후) 기준으로 수행
-        erp_aggregated = self.erp_handler.aggregate_by_key(erp_df)
+        # 집계는 최종 MIS(필터 후) 기준으로 수행
+        mis_aggregated = self.mis_handler.aggregate_by_key(mis_df)
 
         # =========================================================
         # 병합 로직:
@@ -1171,64 +1169,219 @@ class InvestmentValidator:
         
         # Step 1: 자코드 + 공장으로 병합
         merged = targets.merge(
-            erp_aggregated,
+            mis_aggregated,
             on=["자코드", "공장"],
             how="left",
-            suffixes=('', '_ERP')
+            suffixes=('', '_MIS')
         )
         
         # Step 2: 매칭 실패한 경우, 자코드만으로 재시도
-        unmatched = merged[merged["ERP행수"].isna()].copy()
+        unmatched = merged[merged["MIS행수"].isna()].copy()
         
         if len(unmatched) > 0:
             logger.info(
                 f"공장 불일치 {len(unmatched)}건 → 자코드만으로 재매칭 시도"
             )
             
+            retry_cols = ["자코드", "MIS행수", "계정코드입력여부", "계정코드값", "투자계획금액", "품의승인금액"]
             remerged = unmatched[["자코드"]].merge(
-                erp_aggregated[["자코드", "ERP행수", "계정코드입력여부"]].drop_duplicates(subset=["자코드"]),
+                mis_aggregated[retry_cols].drop_duplicates(subset=["자코드"]),
                 on=["자코드"],
                 how="left",
                 suffixes=('', '_retry')
             )
-            
+
             for idx in unmatched.index:
                 자코드 = unmatched.loc[idx, "자코드"]
                 match_result = remerged[remerged["자코드"] == 자코드]
-                
-                if len(match_result) > 0 and not pd.isna(match_result.iloc[0]["ERP행수"]):
-                    merged.loc[idx, "ERP행수"] = match_result.iloc[0]["ERP행수"]
-                    merged.loc[idx, "계정코드입력여부"] = match_result.iloc[0]["계정코드입력여부"]
+
+                if len(match_result) > 0 and not pd.isna(match_result.iloc[0]["MIS행수"]):
+                    row0 = match_result.iloc[0]
+                    merged.loc[idx, "MIS행수"] = row0["MIS행수"]
+                    merged.loc[idx, "계정코드입력여부"] = row0["계정코드입력여부"]
+                    merged.loc[idx, "계정코드값"] = row0["계정코드값"]
+                    merged.loc[idx, "투자계획금액"] = row0["투자계획금액"]
+                    merged.loc[idx, "품의승인금액"] = row0["품의승인금액"]
             
-            rematched = merged.loc[unmatched.index, "ERP행수"].notna().sum()
+            rematched = merged.loc[unmatched.index, "MIS행수"].notna().sum()
             if rematched > 0:
                 logger.info(f"재매칭 성공: {rematched}건")
         
         # 검증 1: 전산 미등록
-        missing_in_erp = merged[merged["ERP행수"].isna()].copy()
-        
+        missing_in_mis = merged[merged["MIS행수"].isna()].copy()
+
         # 검증 2: 계정코드 미입력
         account_missing = merged[
-            (merged["ERP행수"].notna()) & 
+            (merged["MIS행수"].notna()) &
             (merged["계정코드입력여부"] == False)
         ].copy()
-        
-        logger.info(
-            f"검증 완료 - 전산미등록: {len(missing_in_erp)}건, "
-            f"계정코드미입력: {len(account_missing)}건"
+
+        # 검증 3: 품의승인금액 미입력
+        # MIS에 등록은 됐지만 품의승인금액이 0이고 실제 파일에는 품의금액이 있는 경우
+        # (실제 파일=천원 단위, MIS=원 단위)
+        approval_missing = merged[
+            (merged["MIS행수"].notna()) &
+            (merged["품의승인금액"].fillna(0) == 0) &
+            (merged["품의금액합"] > 0)
+        ].copy()
+        if not approval_missing.empty:
+            approval_missing["MIS품의승인금액(천원)"] = approval_missing["품의승인금액"].fillna(0) / 1000
+            approval_missing["차액(천원)"] = (
+                approval_missing["품의금액합"] - approval_missing["MIS품의승인금액(천원)"]
+            )
+
+        # 검증 4: 계정코드 오입력
+        # 자본적 > 0 (수익적 0) → 955701
+        # 수익적 > 0 (자본적 0) → 524403
+        # 둘 다 > 0 → 955701, 524403 모두 필요
+        def expected_acct(row) -> set:
+            capex = float(row.get("자본적", 0) or 0)
+            opex = float(row.get("수익적", 0) or 0)
+            expected = set()
+            if capex > 0:
+                expected.add("955701")
+            if opex > 0:
+                expected.add("524403")
+            return expected
+
+        def acct_mismatch(row) -> bool:
+            if pd.isna(row.get("MIS행수")):
+                return False
+            expected = expected_acct(row)
+            if not expected:
+                return False
+            actual_str = str(row.get("계정코드값", "") or "").strip()
+            if not actual_str:
+                # 계정코드 자체가 비어있는 경우는 '계정코드미입력'에서 처리
+                return False
+            actual_set = {c.strip() for c in actual_str.split(",") if c.strip()}
+            # 기대 계정코드가 MIS 계정코드 집합에 모두 포함되어야 정상
+            return not expected.issubset(actual_set)
+
+        merged["기대계정코드"] = merged.apply(
+            lambda r: ",".join(sorted(expected_acct(r))), axis=1
         )
-        
+        merged["계정코드오입력"] = merged.apply(acct_mismatch, axis=1)
+        account_mismatch = merged[merged["계정코드오입력"]].copy()
+
+        # 검증 5: MIS 내부 - 투자계획금액 vs 품의승인금액 불일치
+        # (실제 파일과 무관, MIS 자체 검증)
+        plan_approval_mismatch = self._detect_plan_approval_mismatch(mis_df)
+
+        # 검증 6: MIS 내부 - 151+ 자코드의 모코드 미입력
+        # 자코드가 XX151 이상인 경우 모코드가 입력되어 있어야 함
+        missing_parent_code = self._detect_missing_parent_code(mis_df)
+
+        # 검증 7: MIS 내부 - 투자자(담당자) 미입력
+        missing_investor = self._detect_missing_name_column(mis_df, "투자자")
+
+        logger.info(
+            f"검증 완료 - 전산미등록: {len(missing_in_mis)}건, "
+            f"계정코드미입력: {len(account_missing)}건, "
+            f"품의승인금액미입력: {len(approval_missing)}건, "
+            f"계정코드오입력: {len(account_mismatch)}건, "
+            f"계획-승인불일치: {len(plan_approval_mismatch)}건, "
+            f"모코드미입력(151+): {len(missing_parent_code)}건, "
+            f"투자자미입력: {len(missing_investor)}건"
+        )
+
         return {
-            "erp_path": erp_path,
+            "mis_path": mis_path,
             "actual_path": Path(actual_path),
-            "erp_data": erp_df,
-            "erp_aggregated": erp_aggregated,
+            "mis_data": mis_df,
+            "mis_aggregated": mis_aggregated,
             "targets": targets,
             "actual_all": actual_all,
             "merged": merged,
-            "missing_in_erp": missing_in_erp,
+            "missing_in_mis": missing_in_mis,
             "account_missing": account_missing,
+            "approval_missing": approval_missing,
+            "account_mismatch": account_mismatch,
+            "plan_approval_mismatch": plan_approval_mismatch,
+            "missing_parent_code": missing_parent_code,
+            "missing_investor": missing_investor,
         }
+
+    def _detect_plan_approval_mismatch(self, mis_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        MIS 내부 검증: 투자계획금액 vs 품의승인금액 불일치
+        - 양쪽 모두 > 0이면서 금액이 다른 행을 추출
+        - 한쪽이 0인 경우는 '품의승인금액 미입력' 등 다른 검증에서 처리
+        """
+        if mis_df is None or mis_df.empty:
+            return pd.DataFrame()
+
+        needed = ["투자계획금액", "품의승인금액"]
+        if not all(c in mis_df.columns for c in needed):
+            return pd.DataFrame()
+
+        work = mis_df.copy()
+        work["_계획"] = self.normalizer.to_number_series(work["투자계획금액"])
+        work["_승인"] = self.normalizer.to_number_series(work["품의승인금액"])
+
+        mask = (work["_계획"] > 0) & (work["_승인"] > 0) & (work["_계획"] != work["_승인"])
+        out = work[mask].copy()
+
+        if out.empty:
+            return out
+
+        out["계획-승인차액"] = out["_계획"] - out["_승인"]
+        # 보조 컬럼 제거(정렬용 차액은 남김)
+        out.drop(columns=["_계획", "_승인"], inplace=True)
+
+        # 자코드 기준 정렬
+        sort_cols = [c for c in ["자코드", "공장"] if c in out.columns]
+        if sort_cols:
+            out = out.sort_values(sort_cols).reset_index(drop=True)
+        return out
+
+    def _detect_missing_parent_code(self, mis_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        MIS 내부 검증: 151+ 자코드인데 모코드가 비어있는 경우
+        - 자코드가 [A-Z]{2}\\d{3} 형식이면서 끝 3자리 숫자가 151 이상
+        - 모코드 컬럼이 빈값/하이픈인 행을 추출
+        """
+        if mis_df is None or mis_df.empty or "모코드" not in mis_df.columns:
+            return pd.DataFrame()
+
+        work = mis_df.copy()
+
+        def extract_num(code) -> int:
+            m = re.match(r'^[A-Za-z]{2}(\d{3})$', str(code).strip())
+            return int(m.group(1)) if m else -1
+
+        work["_자코드숫자"] = work["자코드"].apply(extract_num)
+        work["_모코드비움"] = (
+            work["모코드"].fillna("").astype(str).str.strip().isin(["", "-", "nan", "NaN"])
+        )
+
+        mask = (work["_자코드숫자"] >= 151) & (work["_모코드비움"])
+        out = work[mask].copy()
+        out.drop(columns=["_자코드숫자", "_모코드비움"], inplace=True)
+
+        sort_cols = [c for c in ["자코드", "공장"] if c in out.columns]
+        if sort_cols:
+            out = out.sort_values(sort_cols).reset_index(drop=True)
+        return out
+
+    def _detect_missing_name_column(self, mis_df: pd.DataFrame, col_name: str) -> pd.DataFrame:
+        """
+        MIS 내부 검증: 지정한 컬럼이 입력되지 않은 행 추출
+        - 투자명, 투자자(담당자) 등 이름 계열 컬럼에 사용
+        """
+        if mis_df is None or mis_df.empty or col_name not in mis_df.columns:
+            return pd.DataFrame()
+
+        work = mis_df.copy()
+        empty_mask = (
+            work[col_name].fillna("").astype(str).str.strip().isin(["", "-", "nan", "NaN"])
+        )
+        out = work[empty_mask].copy()
+
+        sort_cols = [c for c in ["자코드", "공장"] if c in out.columns]
+        if sort_cols:
+            out = out.sort_values(sort_cols).reset_index(drop=True)
+        return out
     
     def generate_report(
         self, 
@@ -1243,47 +1396,82 @@ class InvestmentValidator:
         # 요약 정보
         targets = validation_result["targets"]
         summary = pd.DataFrame([{
-            "종합정보시스템 파일": validation_result["erp_path"].name,
+            "종합정보시스템 파일": validation_result["mis_path"].name,
             "실제 투자실적 파일": validation_result["actual_path"].name,
             "실제 등록대상 행수": int(len(targets)),
             "실제 등록대상 자코드수": int(targets["자코드"].nunique()),
             "종합정보 자코드수": int(
-                validation_result["erp_data"]["자코드"].nunique()
+                validation_result["mis_data"]["자코드"].nunique()
             ),
-            "전산미등록": int(len(validation_result["missing_in_erp"])),
+            "전산미등록": int(len(validation_result["missing_in_mis"])),
             "계정코드미입력": int(len(validation_result["account_missing"])),
+            "품의승인금액미입력": int(len(validation_result.get("approval_missing", pd.DataFrame()))),
+            "계정코드오입력": int(len(validation_result.get("account_mismatch", pd.DataFrame()))),
+            "계획-승인금액불일치": int(len(validation_result.get("plan_approval_mismatch", pd.DataFrame()))),
+            "모코드미입력(151+)": int(len(validation_result.get("missing_parent_code", pd.DataFrame()))),
+            "투자자미입력": int(len(validation_result.get("missing_investor", pd.DataFrame()))),
             "실제파일_사용시트": targets.attrs.get("used_sheet", ""),
             "실제파일_헤더행(0기준)": targets.attrs.get("header_row", ""),
         }])
-        
+
         # Excel 파일 작성
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             summary.to_excel(writer, index=False, sheet_name="요약")
-            
-            validation_result["missing_in_erp"].to_excel(
+
+            validation_result["missing_in_mis"].to_excel(
                 writer, index=False, sheet_name="전산미등록"
             )
-            
+
             validation_result["account_missing"].to_excel(
                 writer, index=False, sheet_name="계정코드미입력"
             )
-            
-            validation_result["erp_aggregated"].to_excel(
+
+            approval_missing = validation_result.get("approval_missing", pd.DataFrame())
+            if not approval_missing.empty:
+                approval_missing.to_excel(
+                    writer, index=False, sheet_name="품의승인금액미입력"
+                )
+
+            account_mismatch = validation_result.get("account_mismatch", pd.DataFrame())
+            if not account_mismatch.empty:
+                account_mismatch.to_excel(
+                    writer, index=False, sheet_name="계정코드오입력"
+                )
+
+            plan_approval_mismatch = validation_result.get("plan_approval_mismatch", pd.DataFrame())
+            if not plan_approval_mismatch.empty:
+                plan_approval_mismatch.to_excel(
+                    writer, index=False, sheet_name="계획-승인금액불일치"
+                )
+
+            missing_parent_code = validation_result.get("missing_parent_code", pd.DataFrame())
+            if not missing_parent_code.empty:
+                missing_parent_code.to_excel(
+                    writer, index=False, sheet_name="모코드미입력(151+)"
+                )
+
+            missing_investor = validation_result.get("missing_investor", pd.DataFrame())
+            if not missing_investor.empty:
+                missing_investor.to_excel(
+                    writer, index=False, sheet_name="투자자미입력"
+                )
+
+            validation_result["mis_aggregated"].to_excel(
                 writer, index=False, sheet_name="종합정보 집계(자코드+공장)"
             )
 
-            # ERP 입력오류(본사 단독 + 금액 입력) 목록
-            erp_data = validation_result.get("erp_data")
+            # MIS 입력오류(본사 단독 + 금액 입력) 목록
+            mis_data = validation_result.get("mis_data")
             hq_err_df = None
-            if erp_data is not None:
-                hq_err_df = erp_data.attrs.get("hq_amount_error_df")
+            if mis_data is not None:
+                hq_err_df = mis_data.attrs.get("hq_amount_error_df")
             if isinstance(hq_err_df, pd.DataFrame) and not hq_err_df.empty:
-                hq_err_df.to_excel(writer, index=False, sheet_name="ERP입력오류(본사금액)")
+                hq_err_df.to_excel(writer, index=False, sheet_name="MIS입력오류(본사금액)")
 
             validation_result["targets"].to_excel(
                 writer, index=False, sheet_name="실제대상목록(필터후)"
             )
-            
+
             validation_result["merged"].to_excel(
                 writer, index=False, sheet_name="병합결과(검토용)"
             )
@@ -1328,7 +1516,7 @@ def main(
     print(f"투자실적 검증 완료")
     print(f"{'='*60}")
     print(f"결과 파일: {output_path}")
-    print(f"전산미등록: {len(result['missing_in_erp'])}건")
+    print(f"전산미등록: {len(result['missing_in_mis'])}건")
     print(f"계정코드미입력: {len(result['account_missing'])}건")
     print(f"{'='*60}\n")
 
@@ -1339,16 +1527,16 @@ if __name__ == "__main__":
     # - 헤드리스/서버 환경에서는 actual_path를 직접 지정해서 실행하세요.
     #
     # 예)
-    #   python investment_validator.py --actual "/path/to/actual.xlsx" --erp "/path/to/erp.xlsx"
+    #   python investment_validator.py --actual "/path/to/actual.xlsx" --MIS "/path/to/MIS.xlsx"
     import argparse
 
     parser = argparse.ArgumentParser(description="투자실적 검증 자동화")
     parser.add_argument("--actual", dest="actual_path", required=False, help="실제 투자실적 파일 경로")
     parser.add_argument("--sheet", dest="actual_sheet_name", default=0, help="시트 이름 또는 인덱스 (기본 0)")
-    parser.add_argument("--erp", dest="erp_path", required=False, help="ERP(종합정보) 파일 경로 (미지정 시 최신 파일 자동 선택)")
+    parser.add_argument("--MIS", dest="mis_path", required=False, help="MIS(종합정보) 파일 경로 (미지정 시 최신 파일 자동 선택)")
     args = parser.parse_args()
 
-    # Config 경로는 기본값 유지. 단, --erp를 주면 해당 파일을 우선 사용
+    # Config 경로는 기본값 유지. 단, --MIS를 주면 해당 파일을 우선 사용
     cfg = Config()
     validator = InvestmentValidator(cfg)
 
@@ -1356,26 +1544,26 @@ if __name__ == "__main__":
         # GUI 환경이면 파일 선택 다이얼로그
         main(actual_path=None, actual_sheet_name=args.actual_sheet_name)
     else:
-        # ERP 파일 강제 지정 옵션 지원
-        if args.erp_path:
-            erp_p = Path(args.erp_path)
-            erp_df = validator.erp_handler.load_file(erp_p)
-            erp_agg = validator.erp_handler.aggregate_by_key(erp_df)
+        # MIS 파일 강제 지정 옵션 지원
+        if args.mis_path:
+            MIS_p = Path(args.mis_path)
+            mis_df = validator.mis_handler.load_file(MIS_p)
+            MIS_agg = validator.mis_handler.aggregate_by_key(mis_df)
             targets, actual_all = validator.actual_handler.load_file(Path(args.actual_path), args.actual_sheet_name)
 
-            merged = targets.merge(erp_agg, on=["자코드", "공장"], how="left", suffixes=('', '_ERP'))
-            missing_in_erp = merged[merged["ERP행수"].isna()].copy()
-            account_missing = merged[(merged["ERP행수"].notna()) & (merged["계정코드입력여부"] == False)].copy()
+            merged = targets.merge(MIS_agg, on=["자코드", "공장"], how="left", suffixes=('', '_MIS'))
+            missing_in_mis = merged[merged["MIS행수"].isna()].copy()
+            account_missing = merged[(merged["MIS행수"].notna()) & (merged["계정코드입력여부"] == False)].copy()
 
             result = {
-                "erp_path": erp_p,
+                "mis_path": MIS_p,
                 "actual_path": Path(args.actual_path),
-                "erp_data": erp_df,
-                "erp_aggregated": erp_agg,
+                "mis_data": mis_df,
+                "mis_aggregated": MIS_agg,
                 "targets": targets,
                 "actual_all": actual_all,
                 "merged": merged,
-                "missing_in_erp": missing_in_erp,
+                "missing_in_mis": missing_in_mis,
                 "account_missing": account_missing,
             }
             out = validator.generate_report(result)
