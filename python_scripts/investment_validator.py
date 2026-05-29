@@ -889,6 +889,22 @@ class ActualFileHandler:
         result.loc[bad_plant & (~is_detail) & raw_code.isna(), "자코드_산출"] = ""
 
         # ---------------------------------------------------------
+        # 모코드 산출
+        # - 150 이하 투자코드를 여러 자코드로 분할 사용할 경우,
+        #   마스터행(└ 없음)의 코드가 모코드, 세부행(└)의 코드가 자코드가 됨
+        # - 세부행이 '자기 코드'를 가진 경우에만 직전 마스터행 코드를 모코드로 부여
+        #   (세부행이 코드 없이 부모를 상속한 경우는 분할이 아니므로 공란)
+        # ---------------------------------------------------------
+        master_code = raw_code.where(~is_detail)  # 마스터(비세부)행의 코드만
+        master_code_ffill = master_code.ffill()
+        mask_split = raw_code.notna() & is_detail
+
+        result["모코드_산출"] = ""
+        result.loc[mask_split, "모코드_산출"] = (
+            master_code_ffill.loc[mask_split].fillna("").astype(str)
+        )
+
+        # ---------------------------------------------------------
         # 부서코드/유형(계정코드) 산출
         # - 세부행(└)은 부모 행의 부서코드/유형을 상속
         # - 구분행에는 전파하지 않음
@@ -963,6 +979,7 @@ class ActualFileHandler:
                     "부서코드_원본": ("부서코드_원본", "first"),
                     "유형_원본(계정코드)": ("유형_원본(계정코드)", "first"),
                     "코드_원본(자코드)": ("코드_원본(자코드)", "first"),
+                    "모코드_산출": ("모코드_산출", "first"),
                     "자본적": ("자본적", "sum"),
                     "수익적": ("수익적", "sum"),
                     "품의금액합": ("품의금액합", "sum"),
@@ -978,7 +995,7 @@ class ActualFileHandler:
             "공장", "부서", "투자명",
             "부서코드_원본", "유형_원본(계정코드)", "코드_원본(자코드)",
             "자본적", "수익적", "품의금액합",
-            "자코드_산출", "부서코드_산출", "계정코드_산출",
+            "자코드_산출", "부서코드_산출", "계정코드_산출", "모코드_산출",
         ]
         aggregated = aggregated[keep_cols].copy()
 
@@ -1217,23 +1234,25 @@ class InvestmentValidator:
         # 검증 1: 전산 미등록
         missing_in_mis = merged[merged["MIS행수"].isna()].copy()
 
-        # 검증 2: 계정코드 미입력
+        # 검증 2: 계정코드 미기입
         account_missing = merged[
             (merged["MIS행수"].notna()) &
             (merged["계정코드입력여부"] == False)
         ].copy()
 
-        # 검증 3: 승인금액 오기입
-        # 실제 파일 품의금액(천원)과 MIS 품의승인금액(원) 비교
-        # - MIS 품의승인금액 = 0 (미입력) 케이스 포함
-        # - 금액이 다른 모든 케이스 검출
-        approval_mismatch = merged[merged["MIS행수"].notna()].copy()
+        # 검증 3: 승인금액 미기입
+        # MIS에 등록은 됐지만 품의승인금액이 비어있는(=0) 건만 검출
+        # (실제 파일=천원 단위, MIS=원 단위)
+        approval_mismatch = merged[
+            (merged["MIS행수"].notna()) &
+            (merged["품의승인금액"].fillna(0) == 0) &
+            (merged["품의금액합"] > 0)
+        ].copy()
         if not approval_mismatch.empty:
             approval_mismatch["MIS품의승인금액(천원)"] = approval_mismatch["품의승인금액"].fillna(0) / 1000
             approval_mismatch["차액(천원)"] = (
                 approval_mismatch["품의금액합"] - approval_mismatch["MIS품의승인금액(천원)"]
             )
-            approval_mismatch = approval_mismatch[approval_mismatch["차액(천원)"] != 0].copy()
 
         # 검증 4: 계정코드 오입력
         # - 자코드 끝 3자리 ≤ 150: 실제 파일의 유형(I열, 계정코드_산출) 기준
@@ -1271,8 +1290,8 @@ class InvestmentValidator:
             return actual_set != {expected}
 
         merged["기대계정코드"] = merged.apply(expected_acct, axis=1)
-        merged["계정코드오입력"] = merged.apply(acct_mismatch, axis=1)
-        account_mismatch = merged[merged["계정코드오입력"]].copy()
+        merged["계정코드오기입"] = merged.apply(acct_mismatch, axis=1)
+        account_mismatch = merged[merged["계정코드오기입"]].copy()
 
         # 검증 5: MIS 내부 - 151+ 자코드의 모코드 미입력
         # 자코드가 XX151 이상인 경우 모코드가 입력되어 있어야 함
@@ -1283,11 +1302,11 @@ class InvestmentValidator:
 
         logger.info(
             f"검증 완료 - 전산미등록: {len(missing_in_mis)}건, "
-            f"계정코드미입력: {len(account_missing)}건, "
-            f"계정코드오입력: {len(account_mismatch)}건, "
-            f"승인금액오기입: {len(approval_mismatch)}건, "
-            f"모코드미입력(151+): {len(missing_parent_code)}건, "
-            f"투자자미입력: {len(missing_investor)}건"
+            f"계정코드미기입: {len(account_missing)}건, "
+            f"계정코드오기입: {len(account_mismatch)}건, "
+            f"승인금액미기입: {len(approval_mismatch)}건, "
+            f"모코드미기입(151+): {len(missing_parent_code)}건, "
+            f"투자자미기입: {len(missing_investor)}건"
         )
 
         return {
@@ -1364,34 +1383,62 @@ class InvestmentValidator:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = self.config.output_dir / f"투자실적_점검결과_{timestamp}.xlsx"
         
-        # 요약 정보
-        targets = validation_result["targets"]
-        summary = pd.DataFrame([{
-            "종합정보시스템 파일": validation_result["mis_path"].name,
-            "실제 투자실적 파일": validation_result["actual_path"].name,
-            "실제 등록대상 행수": int(len(targets)),
-            "실제 등록대상 자코드수": int(targets["자코드"].nunique()),
-            "종합정보 자코드수": int(
-                validation_result["mis_data"]["자코드"].nunique()
-            ),
-            "전산미등록": int(len(validation_result["missing_in_mis"])),
-            "계정코드미입력": int(len(validation_result["account_missing"])),
-            "계정코드오입력": int(len(validation_result.get("account_mismatch", pd.DataFrame()))),
-            "투자자미입력": int(len(validation_result.get("missing_investor", pd.DataFrame()))),
-            "승인금액오기입": int(len(validation_result.get("approval_mismatch", pd.DataFrame()))),
-            "모코드미입력(151+)": int(len(validation_result.get("missing_parent_code", pd.DataFrame()))),
-            "실제파일_사용시트": targets.attrs.get("used_sheet", ""),
-            "실제파일_헤더행(0기준)": targets.attrs.get("header_row", ""),
-        }])
+        # 요약 정보: 담당부서 정정 요청용 오류 건별 목록
+        # 필드: 공장 / 부서 / 투자명 / 자코드 / 오류유형
+        # 오류유형: 미등록 / 계정코드 / 투자자 / 투자금액
+        summary_cols = ["공장", "부서", "투자명", "자코드"]
+
+        def extract_error_rows(df: pd.DataFrame, error_type: str) -> pd.DataFrame:
+            if df is None or df.empty:
+                return pd.DataFrame(columns=summary_cols + ["오류유형"])
+            out = pd.DataFrame()
+            for c in summary_cols:
+                out[c] = df[c] if c in df.columns else ""
+            out["오류유형"] = error_type
+            return out
+
+        summary = pd.concat(
+            [
+                extract_error_rows(validation_result["missing_in_mis"], "미등록"),
+                extract_error_rows(validation_result["account_missing"], "계정코드"),
+                extract_error_rows(validation_result.get("account_mismatch", pd.DataFrame()), "계정코드"),
+                extract_error_rows(validation_result.get("missing_investor", pd.DataFrame()), "투자자"),
+                extract_error_rows(validation_result.get("approval_mismatch", pd.DataFrame()), "투자금액"),
+            ],
+            ignore_index=True,
+        )
+        if not summary.empty:
+            summary = (
+                summary
+                .drop_duplicates(subset=["공장", "부서", "자코드", "오류유형"])
+                .sort_values(["공장", "부서", "자코드"])
+                .reset_index(drop=True)
+            )
+
+            # 모코드 컬럼 추가 (실제 파일 기준 자코드→모코드 매핑, 없으면 공란)
+            targets = validation_result["targets"]
+            mojo_map: dict[str, str] = {}
+            if "모코드_산출" in targets.columns:
+                for jc, mj in zip(
+                    targets["자코드"].astype(str),
+                    targets["모코드_산출"].fillna("").astype(str),
+                ):
+                    mj = mj.strip()
+                    if jc and mj:
+                        mojo_map[jc] = mj
+            summary.insert(
+                summary.columns.get_loc("자코드") + 1,
+                "모코드",
+                summary["자코드"].astype(str).map(lambda x: mojo_map.get(x, "")),
+            )
 
         # 시트별 컬럼 정리 헬퍼
         def slim_actual(df: pd.DataFrame, extra: list[str] | None = None,
                         renames: dict[str, str] | None = None) -> pd.DataFrame:
             """실제 파일 기반 시트용 컬럼 정리"""
-            base = ["공장", "부서", "투자명", "부서코드_산출", "자코드", "계정코드_산출"]
+            base = ["공장", "부서", "투자명", "자코드", "계정코드_산출"]
             cols = base + (extra or [])
             default_renames = {
-                "부서코드_산출": "부서코드",
                 "계정코드_산출": "계정코드(실제)",
             }
             default_renames.update(renames or {})
@@ -1404,7 +1451,7 @@ class InvestmentValidator:
 
         def slim_mis(df: pd.DataFrame) -> pd.DataFrame:
             """MIS 파일 기반 시트용 컬럼 정리"""
-            base = ["공장", "부서", "자코드", "모코드", "부서코드", "계정코드", "투자명", "투자자"]
+            base = ["공장", "부서", "자코드", "모코드", "계정코드", "투자명", "투자자"]
             if df is None or df.empty:
                 return pd.DataFrame(columns=base)
             selected = [c for c in base if c in df.columns]
@@ -1414,14 +1461,15 @@ class InvestmentValidator:
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             summary.to_excel(writer, index=False, sheet_name="요약")
 
-            slim_actual(
-                validation_result["missing_in_mis"],
-                extra=["자본적", "수익적", "품의금액합"],
-            ).to_excel(writer, index=False, sheet_name="전산미등록")
+            missing_in_mis = validation_result["missing_in_mis"]
+            missing_cols = [c for c in ["공장", "부서", "투자명", "자코드"] if c in missing_in_mis.columns]
+            (missing_in_mis[missing_cols] if not missing_in_mis.empty
+             else pd.DataFrame(columns=["공장", "부서", "투자명", "자코드"])
+             ).to_excel(writer, index=False, sheet_name="전산미등록")
 
             slim_actual(
                 validation_result["account_missing"]
-            ).to_excel(writer, index=False, sheet_name="계정코드미입력")
+            ).to_excel(writer, index=False, sheet_name="계정코드미기입")
 
             account_mismatch = validation_result.get("account_mismatch", pd.DataFrame())
             if not account_mismatch.empty:
@@ -1429,12 +1477,12 @@ class InvestmentValidator:
                     account_mismatch,
                     extra=["계정코드값"],
                     renames={"계정코드값": "계정코드(MIS)"},
-                ).to_excel(writer, index=False, sheet_name="계정코드오입력")
+                ).to_excel(writer, index=False, sheet_name="계정코드오기입")
 
             missing_investor = validation_result.get("missing_investor", pd.DataFrame())
             if not missing_investor.empty:
                 slim_mis(missing_investor).to_excel(
-                    writer, index=False, sheet_name="투자자미입력"
+                    writer, index=False, sheet_name="투자자미기입"
                 )
 
             approval_mismatch = validation_result.get("approval_mismatch", pd.DataFrame())
@@ -1443,12 +1491,12 @@ class InvestmentValidator:
                     approval_mismatch,
                     extra=["품의금액합", "MIS품의승인금액(천원)", "차액(천원)"],
                     renames={"품의금액합": "실제품의금액(천원)"},
-                ).to_excel(writer, index=False, sheet_name="승인금액오기입")
+                ).to_excel(writer, index=False, sheet_name="승인금액미기입")
 
             missing_parent_code = validation_result.get("missing_parent_code", pd.DataFrame())
             if not missing_parent_code.empty:
                 slim_mis(missing_parent_code).to_excel(
-                    writer, index=False, sheet_name="모코드미입력(151+)"
+                    writer, index=False, sheet_name="모코드미기입(151+)"
                 )
 
             # MIS 입력오류(본사 단독 + 금액 입력) 목록
@@ -1460,7 +1508,13 @@ class InvestmentValidator:
                 slim_mis(hq_err_df).to_excel(
                     writer, index=False, sheet_name="MIS입력오류(본사금액)"
                 )
-        
+
+            # 투자명 컬럼 너비 확대 (내용이 길어 잘리는 것 방지)
+            for ws in writer.sheets.values():
+                for cell in ws[1]:
+                    if cell.value == "투자명":
+                        ws.column_dimensions[cell.column_letter].width = 40
+
         logger.info(f"리포트 생성 완료: {output_path}")
         return output_path
 
@@ -1502,7 +1556,7 @@ def main(
     print(f"{'='*60}")
     print(f"결과 파일: {output_path}")
     print(f"전산미등록: {len(result['missing_in_mis'])}건")
-    print(f"계정코드미입력: {len(result['account_missing'])}건")
+    print(f"계정코드미기입: {len(result['account_missing'])}건")
     print(f"{'='*60}\n")
 
 
